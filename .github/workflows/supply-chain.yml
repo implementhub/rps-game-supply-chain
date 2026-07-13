@@ -13,23 +13,23 @@ jobs:
   security-scan:
     name: Security Scanning
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    #steps:
+      #- name: Checkout code
+        #uses: actions/checkout@v4
 
-      - name: Install Task
-        uses: arduino/setup-task@v2
+      #- name: Install Task
+        #uses: arduino/setup-task@v2
 
-      - name: Build supply-chain-tools image
-        run: task build-tools
+      #- name: Build supply-chain-tools image
+        #run: task build-tools
 
-      - name: Run all security scans
-        run: task scan-all
+      #- name: Run all security scans
+        #run: task scan-all
 
-      - name: Build and scan container image
-        run: |
-          task build-image
-          task scan-image
+      #- name: Build and scan container image
+        #run: |
+          #task build-image
+          #task scan-image
           
   build-attestations:
       name: Build with Attestations

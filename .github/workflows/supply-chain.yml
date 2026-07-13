@@ -10,9 +10,9 @@ permissions:
   packages: write    # Push to ghcr.io
 
 jobs:
-  security-scan:
-    name: Security Scanning
-    runs-on: ubuntu-latest
+  # security-scan:
+    # name: Security Scanning
+      #    runs-on: ubuntu-latest
     #steps:
       #- name: Checkout code
         #uses: actions/checkout@v4

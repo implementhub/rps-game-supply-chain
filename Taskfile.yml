@@ -1,0 +1,395 @@
+version: '3'
+
+vars:
+  DOCKER_RUN: docker run --rm -v {{.PWD}}:/workspace supply-chain-tools
+  DOCKER_RUN_WITH_SOCKET: docker run --rm -v {{.PWD}}:/workspace -v /var/run/docker.sock:/var/run/docker.sock supply-chain-tools
+
+tasks:
+  # =============================================================================
+  # Public Tasks - Student-facing interface
+  # =============================================================================
+  
+  build-tools:
+    desc: "🔧 Build supply-chain-tools Docker image"
+    cmds:
+      - docker build -t supply-chain-tools tools/
+
+  build:
+    desc: "🔨 Build application in Docker"
+    cmds:
+      - "{{.DOCKER_RUN}} task _build"
+  
+  test:
+    desc: "🧪 Run security tests in Docker"
+    cmds:
+      - "{{.DOCKER_RUN}} task _test"
+
+  pipeline:
+    desc: "🚀 Run complete pipeline in Docker"
+    cmds:
+      - "{{.DOCKER_RUN}} task _pipeline"
+
+  scan-all:
+    desc: "🔍 Run all security scans in Docker"
+    cmds:
+      - "{{.DOCKER_RUN}} task _scan-all"
+
+  scan-source:
+    desc: "📝 Scan source code in Docker"
+    cmds:
+      - "{{.DOCKER_RUN}} task _scan-source"
+
+  scan-deps:
+    desc: "📦 Scan dependencies in Docker"
+    cmds:
+      - "{{.DOCKER_RUN}} task _scan-deps"
+
+  scan-dockerfile:
+    desc: "🐳 Scan Dockerfile in Docker"
+    cmds:
+      - "{{.DOCKER_RUN}} task _scan-dockerfile"
+
+  scan-iac:
+    desc: "🏗️ Scan IaC in Docker"
+    cmds:
+      - "{{.DOCKER_RUN}} task _scan-iac"
+
+  scan-manifests:
+    desc: "☸️ Scan K8s manifests in Docker"
+    cmds:
+      - "{{.DOCKER_RUN}} task _scan-manifests"
+
+  generate-sbom:
+    desc: "📋 Generate SBOM in Docker"
+    cmds:
+      - "{{.DOCKER_RUN}} task _generate-sbom"
+
+  sign-image:
+    desc: "🔏 Sign container image with ephemeral keys"
+    cmds:
+      - "{{.DOCKER_RUN_WITH_SOCKET}} task _sign-image"
+
+  build-image:
+    desc: "🏗️ Build container image"
+    cmds:
+      - echo "Building container image..."
+      - docker build -f src/docker/Dockerfile -t supply-chain-app:latest src/
+      - echo "Container image built successfully"
+
+  build-image-with-attestation:
+    desc: "🏗️ Build container image with provenance"
+    cmds:
+      - export BUILDX_METADATA_PROVENANCE=max BUILDX_GIT_INFO=1 BUILDX_GIT_LABELS=1 BUILDER_ID="$(whoami)@$(hostname)"
+      - echo "Building container image with attestation artifacts..."
+      - docker buildx build --provenance=mode=max,builder-id="azureuser@vm-lab-nestor" --sbom=true -o type=local,dest=./out -f src/docker/Dockerfile src
+      - echo "Container with attestation built successfully"
+
+  scan-image:
+    desc: "🔍 Scan built container image for vulnerabilities"
+    cmds:
+      - "{{.DOCKER_RUN_WITH_SOCKET}} task _scan-image"
+
+  exec:
+    desc: "🔧 Execute command inside supply-chain-tools container (e.g., task exec -- cosign sign --yes $IMAGE)"
+    cmds:
+      - "{{.DOCKER_RUN_WITH_SOCKET}} {{.CLI_ARGS}}"
+
+  verify-image:
+    desc: "🔍 Verify container image signature with public key"
+    cmds:
+      - "{{.DOCKER_RUN_WITH_SOCKET}} task _verify-image"
+
+  validate:provenance:
+    desc: "✅ Validate SLSA provenance attestation"
+    cmds:
+      - "{{.DOCKER_RUN}} ./scripts/validate-provenance.sh"
+
+  validate:sbom:
+    desc: "✅ Validate SBOM attestation"
+    cmds:
+      - "{{.DOCKER_RUN}} ./scripts/validate-sbom.sh"
+
+  validate:vuln-source:
+    desc: "✅ Validate source vulnerability attestation"
+    cmds:
+      - "{{.DOCKER_RUN}} ./scripts/validate-vuln.sh source"
+
+  validate:vuln-iac:
+    desc: "✅ Validate IaC vulnerability attestation"
+    cmds:
+      - "{{.DOCKER_RUN}} ./scripts/validate-vuln.sh iac"
+
+  validate:vuln-image:
+    desc: "✅ Validate image vulnerability attestation"
+    cmds:
+      - "{{.DOCKER_RUN}} ./scripts/validate-vuln.sh image"
+
+  validate:all-attestations:
+    desc: "✅ Validate all Phase 2 attestations"
+    cmds:
+      - task validate:provenance
+      - task validate:sbom
+      - task validate:vuln-source
+      - task validate:vuln-iac
+      - task validate:vuln-image
+      - echo "🎉 All attestations validated successfully!"
+
+  validate:phase3:
+    desc: "✅ Validate Phase 3 keyless signing completion"
+    cmds:
+      - |
+        echo "🔍 Validating Phase 3 completion..."
+        
+        # Check environment variables
+        if [ -z "$DIGEST" ]; then
+          echo "❌ DIGEST variable not set"
+          echo "   Set with: export DIGEST=sha256:..."
+          exit 1
+        fi
+        echo "✅ DIGEST variable set"
+        
+        if [ -z "$IMAGE" ]; then
+          echo "❌ IMAGE variable not set"
+          echo "   Set with: export IMAGE=ttl.sh/supply-chain-app-\$(whoami)@\$DIGEST"
+          exit 1
+        fi
+        echo "✅ IMAGE variable set: $IMAGE"
+        
+        # Verify signature and attestations in one call
+        echo ""
+        echo "🔐 Verifying signature and attestations..."
+        VERIFY_OUTPUT=$(cosign verify --experimental-oci11 --certificate-identity-regexp=".*" --certificate-oidc-issuer-regexp=".*" $IMAGE 2>&1)
+        
+        if ! echo "$VERIFY_OUTPUT" | grep -q "Verification for"; then
+          echo "❌ Verification failed"
+          echo "   Did you run: cosign sign --yes \$IMAGE"
+          exit 1
+        fi
+        
+        # Extract JSON and count types
+        JSON_OUTPUT=$(echo "$VERIFY_OUTPUT" | grep '^\[')
+        
+        # Check for image signature (type: cosign/sign/v1)
+        SIGNATURE_COUNT=$(echo "$JSON_OUTPUT" | jq '[.[] | select(.critical.type == "https://sigstore.dev/cosign/sign/v1")] | length' 2>/dev/null || echo "0")
+        
+        if [ "$SIGNATURE_COUNT" -ge 1 ]; then
+          echo "✅ Image signature verified"
+        else
+          echo "❌ Image signature not found"
+          echo "   Did you run: cosign sign --yes \$IMAGE"
+          exit 1
+        fi
+        
+        # Count attestations (exclude cosign/sign/v1)
+        ATTESTATION_COUNT=$(echo "$JSON_OUTPUT" | jq '[.[] | select(.critical.type != "https://sigstore.dev/cosign/sign/v1")] | length' 2>/dev/null || echo "0")
+        
+        echo "✅ Attestations verified"
+        echo "   Found $ATTESTATION_COUNT signed attestations"
+        
+        if [ "$ATTESTATION_COUNT" -ge 5 ]; then
+          echo "✅ At least 5 attestations present (provenance, SBOM, 3x vuln)"
+        else
+          echo "⚠️  Expected at least 5 attestations, found $ATTESTATION_COUNT"
+          echo "   Make sure you signed: provenance, SBOM, vuln-source, vuln-iac, vuln-image"
+        fi
+        
+        # Check Rekor entries
+        echo ""
+        echo "📝 Checking Rekor transparency log..."
+        HASH=$(echo $DIGEST | cut -d: -f2)
+        ENTRY_COUNT=$(rekor-cli search --sha $HASH 2>/dev/null | grep -c "^[a-f0-9]" || echo "0")
+        
+        echo "   Found $ENTRY_COUNT Rekor entries"
+        
+        if [ "$ENTRY_COUNT" -ge 6 ]; then
+          echo "✅ Complete transparency log (expected: 6)"
+          echo "   1 image signature + 5 attestations = 6 entries"
+        elif [ "$ENTRY_COUNT" -eq 5 ]; then
+          echo "⚠️  Found 5 entries (expected: 6)"
+          echo "   Possible cause: Missing 'cosign sign' step (Exercise 3.2)"
+          echo "   Or missing one attestation (Exercise 3.4-3.5)"
+        else
+          echo "❌ Incomplete transparency log (expected: 6, found: $ENTRY_COUNT)"
+          echo "   Expected: 1 image signature + 5 attestations"
+          exit 1
+        fi
+        
+        echo ""
+        echo "🎉 Phase 3 validation complete!"
+        echo "✅ Image signed with keyless signing"
+        echo "✅ All attestations signed and attached"
+        echo "✅ Entries logged in Rekor transparency log"
+
+  pipeline-skip-security:
+    desc: "⚠️ Run build pipeline without security checks (testing only)"
+    cmds:
+      - echo "⚠️ SKIPPING SECURITY CHECKS - FOR TESTING ONLY"
+      - task build
+      - task build-image
+      - task generate-sbom
+      - task sign-image
+      - echo "🎉 Build pipeline complete (security checks skipped)"
+      - echo "✅ Application built"
+      - echo "✅ Container image built"
+      - echo "✅ SBOM generated"
+      - echo "✅ Container image signed"
+      - echo "⚠️ Run 'task pipeline' to include security checks"
+
+  # =============================================================================
+  # Private Tasks - Internal implementation (prefixed with _)
+  # Note: No 'desc' field = hidden from 'task --list' but still callable
+  # =============================================================================
+
+  _build:
+    # Internal: Build the application
+    cmds:
+      - echo "🔨 Building Application..."
+      - cd src/app && uv sync
+      - echo "✅ Build complete"
+
+  _test:
+    # Internal: Run security tests
+    cmds:
+      - echo "🧪 Running Security Tests..."
+      - cd src/app && uv run pytest ../tests/ -v
+
+  _pipeline:
+    # Internal: Run complete secure development pipeline
+    cmds:
+      - task _build
+      - task _test
+      - task _scan-all
+      - task _generate-sbom
+      - task _sign-image
+      - echo "🎉 Complete pipeline succeeded!"
+      - echo "✅ Application built and tested"
+      - echo "✅ Security scans passed"
+      - echo "✅ SBOM generated"
+      - echo "✅ Container image signed"
+
+  _scan-all:
+    # Internal: Run all security scans
+    cmds:
+      - task _scan-source
+      - task _scan-deps
+      - task _scan-dockerfile
+      - task _scan-iac
+      - task _scan-manifests
+      - echo "📊 All scans complete"
+
+  _scan-source:
+    # Internal: Scan source code with Bandit
+    cmds:
+      - echo "📝 Scanning source code..."
+      - echo "ℹ️ Using Bandit to scan for hardcoded secrets, SQL injection, and other code security issues"
+      - bandit -r src/app/main.py --exclude src/app/.venv
+
+  _scan-deps:
+    # Internal: Scan dependencies with Trivy
+    cmds:
+      - echo "📦 Scanning dependencies..."
+      - echo "ℹ️ Using Trivy to scan for vulnerable dependencies"
+      - trivy fs --scanners vuln --severity HIGH,CRITICAL src/app/
+
+  _scan-dockerfile:
+    # Internal: Scan Dockerfile configuration with Trivy
+    cmds:
+      - echo "🐳 Scanning Dockerfile..."
+      - echo "ℹ️ Using Trivy to scan for Dockerfile misconfigurations"
+      - trivy config src/docker/Dockerfile --severity MEDIUM,HIGH,CRITICAL
+
+  _scan-iac:
+    # Internal: Scan Infrastructure as Code with Checkov
+    cmds:
+      - echo "🏗️ Scanning IaC..."
+      - checkov -f src/iac/main.tf --skip-check CKV2_AWS_5
+
+  _scan-manifests:
+    # Internal: Scan Kubernetes manifests with Trivy
+    cmds:
+      - echo "☸️ Scanning manifests..."
+      - trivy config src/k8s/ --severity HIGH,CRITICAL
+
+  _scan-image:
+    # Internal: Scan container image with Trivy
+    cmds:
+      - echo "🔍 Scanning container image..."
+      - echo "ℹ️ Using Trivy to scan for vulnerabilities in built image"
+      - trivy image supply-chain-app:latest --scanners vuln --severity HIGH,CRITICAL
+
+  _generate-sbom:
+    # Internal: Generate Software Bill of Materials with Syft
+    cmds:
+      - echo "📋 Generating SBOM..."
+      - syft src/ -o spdx-json > sbom.json
+      - echo "✅ SBOM saved to sbom.json"
+
+  _sign-image:
+    # Internal: Sign container image with ephemeral Cosign keys
+    # TODO: Replace ephemeral keys with keyless signing (Fulcio + Rekor + OIDC)
+    # See plan.md Task 4 Phase 3 for keyless implementation
+    cmds:
+      - echo "🔏 Signing container image..."
+      - echo "🔑 Generating ephemeral signing keys..."
+      - echo "📦 Tagging image for ttl.sh temporary registry..."
+      - |
+        # Generate ephemeral cosign key pair (inside container, private key stays there)
+        echo "y" | COSIGN_PASSWORD="" cosign generate-key-pair
+        
+        # Copy public key to output directory for verification
+        cp cosign.pub output/signing-key.pub
+        echo "🔑 Public key saved to output/signing-key.pub"
+        
+        # Generate unique image name for ttl.sh (24h expiry)
+        IMAGE_ID=$(date +%s)-$(head -c 8 /dev/urandom | base64 | tr -dc 'a-z0-9' | head -c 8)
+        TTL_IMAGE="ttl.sh/supply-chain-${IMAGE_ID}:24h"
+        echo "🏷️ Using temporary image: ${TTL_IMAGE}"
+        
+        # Tag and push to ttl.sh
+        docker tag supply-chain-app:latest ${TTL_IMAGE}
+        echo "📤 Pushing to temporary registry..."
+        docker push ${TTL_IMAGE}
+        
+        # Sign the image using ephemeral key
+        echo "✍️ Signing image with ephemeral cosign key..."
+        COSIGN_PASSWORD="" cosign sign --key cosign.key --yes ${TTL_IMAGE}
+        
+        # Store the image name for verification (in output directory)
+        echo ${TTL_IMAGE} > output/.signed-image
+        echo "✅ Container image signed successfully!"
+        echo "📝 Artifacts saved to output/ directory:"
+        echo "   - output/.signed-image (image reference)"
+        echo "   - output/signing-key.pub (public key for verification)"
+        echo "🔍 You can verify with: task verify-image"
+
+  _verify-image:
+    # Internal: Verify container image signature with ephemeral public key
+    cmds:
+      - echo "🔍 Verifying container image signature..."
+      - |
+        # Check if we have a signed image to verify
+        if [ ! -f output/.signed-image ]; then
+          echo "❌ No signed image found. Run 'task sign-image' first."
+          exit 1
+        fi
+        
+        # Check if we have the public key for verification
+        if [ ! -f output/signing-key.pub ]; then
+          echo "❌ No public key found. Run 'task sign-image' first."
+          exit 1
+        fi
+        
+        SIGNED_IMAGE=$(cat output/.signed-image)
+        echo "🎯 Verifying image: ${SIGNED_IMAGE}"
+        echo "🔑 Using public key: output/signing-key.pub"
+        
+        # Verify the signature using the ephemeral public key
+        echo "🔐 Verifying signature with ephemeral public key..."
+        if cosign verify --key output/signing-key.pub ${SIGNED_IMAGE}; then
+          echo "✅ Signature verification successful!"
+          echo "🔒 Image integrity confirmed"
+          echo "📋 Signature details shown above"
+        else
+          echo "❌ Signature verification failed!"
+          exit 1
+        fi

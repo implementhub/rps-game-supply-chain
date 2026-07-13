@@ -1,0 +1,220 @@
+name: Supply Chain Security Pipeline
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # Sigstore keyless signing
+  contents: read     # Checkout code
+  packages: write    # Push to ghcr.io
+
+jobs:
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Task
+        uses: arduino/setup-task@v2
+
+      - name: Build supply-chain-tools image
+        run: task build-tools
+
+      - name: Run all security scans
+        run: task scan-all
+
+      - name: Build and scan container image
+        run: |
+          task build-image
+          task scan-image
+          
+  build-attestations:
+      name: Build with Attestations
+      runs-on: ubuntu-latest
+      needs: security-scan
+      outputs:
+        image-digest: ${{ steps.push.outputs.digest }}
+      steps:
+        - name: Checkout code
+          uses: actions/checkout@v4
+
+        - name: Install Task
+          uses: arduino/setup-task@v2
+
+        - name: Set up Docker Buildx
+          uses: docker/setup-buildx-action@v3
+
+        - name: Build supply-chain-tools image
+          run: task build-tools
+
+        - name: Log in to ghcr.io
+          uses: docker/login-action@v3
+          with:
+            registry: ghcr.io
+            username: ${{ github.actor }}
+            password: ${{ secrets.GITHUB_TOKEN }}
+
+        - name: Build image with provenance and SBOM (local export)
+          run: |
+            docker buildx build \
+              --provenance=mode=max \
+              --sbom=true \
+              -o type=local,dest=./out \
+              -f src/docker/Dockerfile src
+
+        - name: Load image and tag for push
+          run: |
+            docker buildx build \
+              -t ghcr.io/${{ github.repository_owner }}/supply-chain-app:${{ github.sha }} \
+              --load \
+              -f src/docker/Dockerfile src
+
+        - name: Push image and capture digest
+          id: push
+          run: |
+            docker push ghcr.io/${{ github.repository_owner }}/supply-chain-app:${{ github.sha }}
+            DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/supply-chain-app:${{ github.sha }} | cut -d'@' -f2)
+            echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+
+        - name: Generate vulnerability attestations
+          run: |
+            mkdir -p attestations
+            task exec -- trivy fs --format cosign-vuln src/ > attestations/vuln-source.json
+            task exec -- trivy config --format cosign-vuln src/iac/ > attestations/vuln-iac.json
+            task exec -- trivy image --format cosign-vuln ghcr.io/${{ github.repository_owner }}/supply-chain-app:${{ github.sha }} > attestations/vuln-image.json
+
+        - name: Extract provenance and SBOM predicates
+          run: |
+            cat out/provenance.json | jq .predicate > attestations/provenance.json
+            jq '.predicate' out/sbom.spdx.json > attestations/sbom.json
+
+        - name: Upload attestations
+          uses: actions/upload-artifact@v4
+          with:
+            name: attestations
+            path: attestations/
+
+  sign-and-attest:
+    name: Sign Image and Attestations
+    runs-on: ubuntu-latest
+    needs: build-attestations
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.0
+
+      - name: Download attestations
+        uses: actions/download-artifact@v4
+        with:
+          name: attestations
+          path: attestations/
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Set image reference
+        run: |
+          echo "IMAGE=ghcr.io/${{ github.repository_owner }}/supply-chain-app@${{ needs.build-attestations.outputs.image-digest }}" >> $GITHUB_ENV
+
+      - name: Sign container image
+        run: cosign sign --yes $IMAGE
+
+      - name: Attach SLSA provenance attestation
+        run: |
+          cosign attest --yes \
+            --type slsaprovenance1 \
+            --predicate attestations/provenance.json \
+            $IMAGE
+
+      - name: Attach SBOM attestation
+        run: |
+          cosign attest --yes \
+            --type spdxjson \
+            --predicate attestations/sbom.json \
+            $IMAGE
+
+      - name: Attach vulnerability attestations
+        run: |
+          cosign attest --yes --type vuln --predicate attestations/vuln-source.json $IMAGE
+          cosign attest --yes --type vuln --predicate attestations/vuln-iac.json $IMAGE
+          cosign attest --yes --type vuln --predicate attestations/vuln-image.json $IMAGE
+
+      - name: Debug - list all attached artifacts
+        run: cosign tree --experimental-oci11 $IMAGE
+
+  verify:
+    name: Verify Signatures and Attestations
+    runs-on: ubuntu-latest
+    needs: [build-attestations, sign-and-attest]
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.0
+
+      - name: Install rekor-cli
+        run: |
+          curl -O -L "https://github.com/sigstore/rekor/releases/latest/download/rekor-cli-linux-amd64"
+          sudo mv rekor-cli-linux-amd64 /usr/local/bin/rekor-cli
+          sudo chmod +x /usr/local/bin/rekor-cli
+
+      - name: Set image reference
+        run: |
+          echo "IMAGE=ghcr.io/${{ github.repository_owner }}/supply-chain-app@${{ needs.build-attestations.outputs.image-digest }}" >> $GITHUB_ENV
+
+      - name: Verify image signature
+        run: |
+          cosign verify --experimental-oci11 \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+            $IMAGE > /dev/null
+          echo "Image attestation verified"
+
+      - name: Verify provenance attestation
+        run: |
+          cosign verify-attestation --experimental-oci11 \
+            --type slsaprovenance1 \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+            $IMAGE > /dev/null
+          echo "Provenance attestation verified"
+
+      - name: Verify SBOM attestation
+        run: |
+          cosign verify-attestation --experimental-oci11 \
+            --type spdxjson \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+            $IMAGE > /dev/null
+          echo "SBOM attestation verified"
+
+      - name: Verify vulnerability attestations
+        run: |
+          cosign verify-attestation --experimental-oci11\
+            --type vuln \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+            $IMAGE > /dev/null
+          echo "Vulnerability attestations verified"
+      - name: Debug - full rekor search
+        run: |
+          DIGEST_HASH=$(echo "${{ needs.build-attestations.outputs.image-digest }}" | cut -d: -f2)
+          rekor-cli search --sha $DIGEST_HASH
+
+      - name: Check Rekor entries
+        run: |
+          DIGEST_HASH=$(echo "${{ needs.build-attestations.outputs.image-digest }}" | cut -d: -f2)
+          ENTRY_COUNT=$(rekor-cli search --sha $DIGEST_HASH | grep -c "^[a-f0-9]" || echo "0")
+          echo "Found $ENTRY_COUNT Rekor entries"
+          if [ "$ENTRY_COUNT" -lt 6 ]; then
+            echo "❌ Expected at least 6 Rekor entries, found $ENTRY_COUNT"
+            exit 1
+          fi
+          echo "✅ Complete transparency log confirmed"
